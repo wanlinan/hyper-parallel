@@ -50,9 +50,11 @@ Execution Order:
 6. Backend compilation: InductorPass is TERMINAL (``inductor_mode`` != off).
    It lowers the graph — or its tagged compute regions — to TorchInductor
    kernels; afterwards the FX graph is a wrapper around the compiled callable
-   and no further FX-graph-level pass may run. When PpPass already split the
+   and no further graph-level pass may run. When PpPass already split the
    graph, the pass compiles each per-stage forward/backward subgraph owned by
    the installed schedule instead of the (compute-less) stub.
+7. NPU capture: ACLGraphPass wraps the final scheduled FX regions and keeps
+   host work eager. It requires Inductor compilation and PP to be disabled.
 """
 
 __all__ = ["PassPipeline"]
@@ -62,6 +64,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 from ..pass_config import PassConfig
 from .activation_checkpoint import ActivationCheckpointPass
 from .base import GraphPass
+from .aclgraph_pass import ACLGraphPass
 from .bucketing.bucketing_pass import FsdpBucketingPass
 from .cpu_offload import CpuOffloadPass
 from .inductor_pass import InductorPass
@@ -98,6 +101,7 @@ class PassPipeline:
 
     def build(self) -> "PassPipeline":
         """Build Pass Pipeline."""
+        self.config.validate()
         # 1. Basic optimization
         self.passes.append(DeadCodeEliminationPass())
         self.passes.append(CanonicalizeGraphPass())
@@ -138,6 +142,10 @@ class PassPipeline:
         # compiled callable and no further FX-graph-level pass may run.
         if self.config.inductor_mode != "off":
             self.passes.append(InductorPass())
+
+        # Capture the final scheduled FX regions; replay bypasses Python nodes.
+        if self.config.aclgraph_mode != "off":
+            self.passes.append(ACLGraphPass())
 
         return self
 

@@ -15,7 +15,6 @@
 """Stage-1 tests: build options surface, Trainer re-export identity, boundaries."""
 # pylint: disable=wrong-import-position
 
-import os
 import subprocess
 import sys
 import unittest
@@ -24,6 +23,9 @@ from pathlib import Path
 
 import torch
 
+import hyper_parallel.models as auto_models
+from hyper_parallel.components.quantization.config import LowPrecisionConfig
+from hyper_parallel.models import api
 from hyper_parallel.models.build_options import (
     CompileConfig,
     FSDP2Config,
@@ -31,6 +33,7 @@ from hyper_parallel.models.build_options import (
     ModelBuildOptions,
     normalize_build_options,
 )
+from hyper_parallel.trainer import config as trainer_config
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -44,7 +47,7 @@ class TestBuildOptionsFields(unittest.TestCase):
     """Field/default snapshots for the options owned by build_options."""
 
     def test_compile_config_fields(self):
-        """CompileConfig field order and defaults stay unchanged after the move."""
+        """CompileConfig keeps stable defaults, with ACLGraph explicitly opt-in."""
         self.assertEqual(
             _field_snapshot(CompileConfig),
             [
@@ -62,6 +65,8 @@ class TestBuildOptionsFields(unittest.TestCase):
                 ("max_in_flight_gb", "0.25"),
                 ("offload_budget_gb", "64.0"),
                 ("offload_prefetch_n_layers", "1"),
+                ("aclgraph_mode", "'off'"),
+                ("aclgraph_max_capture_regions", "0"),
             ],
         )
 
@@ -183,9 +188,6 @@ class TestModelBuildOptionsNormalization(unittest.TestCase):
         self.assertEqual(options.activation_swap, "attention")
         self.assertIsInstance(options.compile, CompileConfig)
         self.assertTrue(options.compile.enabled)
-        from hyper_parallel.components.quantization.config import (
-            LowPrecisionConfig,
-        )
         self.assertIsInstance(options.low_precision, LowPrecisionConfig)
         self.assertTrue(options.low_precision.enabled)
 
@@ -217,15 +219,11 @@ class TestTrainerReexportIdentity(unittest.TestCase):
 
     def test_trainer_config_reexport_identity(self):
         """trainer.config CompileConfig/FSDP2Config ARE the build_options classes."""
-        from hyper_parallel.trainer import config as trainer_config
-
         self.assertIs(trainer_config.CompileConfig, CompileConfig)
         self.assertIs(trainer_config.FSDP2Config, FSDP2Config)
 
     def test_package_root_reexport_identity(self):
         """The auto_models package root re-exports the same class objects."""
-        import hyper_parallel.models as auto_models
-
         self.assertIs(auto_models.ModelBuildOptions, ModelBuildOptions)
         self.assertIs(auto_models.CompileConfig, CompileConfig)
         self.assertIs(auto_models.FSDP2Config, FSDP2Config)
@@ -264,8 +262,6 @@ class TestBuildOptionsBoundary(unittest.TestCase):
 
     def test_api_skeleton_surface(self):
         """api.py exposes the stable skeleton and delegates from_pretrained lazily."""
-        from hyper_parallel.models import api
-
         self.assertEqual(
             api.__all__,
             [

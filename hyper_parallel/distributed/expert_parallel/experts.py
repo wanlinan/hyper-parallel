@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from hyper_parallel.components.functional.npu_grouped_swiglu import (
     npu_grouped_swiglu,
 )
+from hyper_parallel.distributed.expert_parallel._tracing import expert_parallel_region
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _install_bound_forward,
 )
@@ -496,24 +497,25 @@ def ep_routed_forward(
         module, hidden_states, router_fn, ep_size, ep_group,
         fused_permute=use_fused_moe_token_permute_and_unpermute,
     )
-    combined_expert_outputs = _run_ep_local_experts(
-        module,
-        dispatch.states,
-        dispatch.expert_indices,
-        dispatch.send_counts,
-        dispatch.receive_counts,
-        ep_group,
-        expert_offset,
-    )
-    return _aggregate_ep_outputs(
-        combined_expert_outputs,
-        dispatch.expert_weights,
-        dispatch.source_indices,
-        dispatch.dispatch_order,
-        output_shape,
-        unpermute_indices=dispatch.unpermute_indices,
-        routing_weights=dispatch.routing_weights,
-    )
+    with expert_parallel_region():
+        combined_expert_outputs = _run_ep_local_experts(
+            module,
+            dispatch.states,
+            dispatch.expert_indices,
+            dispatch.send_counts,
+            dispatch.receive_counts,
+            ep_group,
+            expert_offset,
+        )
+        return _aggregate_ep_outputs(
+            combined_expert_outputs,
+            dispatch.expert_weights,
+            dispatch.source_indices,
+            dispatch.dispatch_order,
+            output_shape,
+            unpermute_indices=dispatch.unpermute_indices,
+            routing_weights=dispatch.routing_weights,
+        )
 
 
 class EPRoutedState(NamedTuple):
@@ -546,22 +548,25 @@ def _plan_routed_slots(
     local_expert_count = module.experts.local_expert_count
     global_expert_count = local_expert_count * ep_size
     topk_indices, topk_weights = router_fn(module, hidden_states)
-    capacity_factor = _resolve_capacity_factor(module)
-    keep = None
-    if capacity_factor is not None:
-        keep, _ = apply_capacity_limit(
-            topk_indices, capacity_factor, global_expert_count, topk_weights,
+    # Keep the router capturable while marking dynamic dispatch and expert rows.
+    with expert_parallel_region():
+        capacity_factor = _resolve_capacity_factor(module)
+        keep = None
+        if capacity_factor is not None:
+            keep, _ = apply_capacity_limit(
+                topk_indices, capacity_factor, global_expert_count, topk_weights,
+            )
+        return _prepare_ep_dispatch(
+            hidden_states, topk_indices, topk_weights,
+            local_expert_count=local_expert_count,
+            ep_size=ep_size,
+            ep_group=ep_group,
+            keep=keep,
+            use_fused_moe_token_permute_and_unpermute=fused_permute,
         )
-    return _prepare_ep_dispatch(
-        hidden_states, topk_indices, topk_weights,
-        local_expert_count=local_expert_count,
-        ep_size=ep_size,
-        ep_group=ep_group,
-        keep=keep,
-        use_fused_moe_token_permute_and_unpermute=fused_permute,
-    )
 
 
+@expert_parallel_region()
 def ep_routed_dispatch(
     module: Any,
     hidden_states: torch.Tensor,
@@ -609,6 +614,7 @@ def ep_routed_dispatch(
     )
 
 
+@expert_parallel_region()
 def ep_routed_experts_and_combine(
     module: Any,
     state: EPRoutedState,

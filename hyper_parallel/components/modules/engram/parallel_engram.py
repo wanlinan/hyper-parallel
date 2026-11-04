@@ -20,7 +20,9 @@ from typing import Any
 import torch
 from torch import nn
 import torch.distributed as dist
-from hyper_parallel.distributed.expert_parallel.collectives import ep_all_to_all
+from hyper_parallel.core.utils.communication import _is_tracing_or_compiling
+from hyper_parallel.distributed.expert_parallel._tracing import expert_parallel_region
+from hyper_parallel.distributed.expert_parallel.collectives import ep_all_to_all, ep_exchange_counts, ep_split_sizes
 
 
 def local_token_mask(token_mask: torch.Tensor | None, hidden_states: torch.Tensor,
@@ -293,6 +295,7 @@ class ParallelEngram:
     _fuse: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
     @staticmethod
+    @expert_parallel_region()
     def _sparse_lookup(
         hash_ids: torch.Tensor,
         embedding: nn.Embedding,
@@ -311,14 +314,17 @@ class ParallelEngram:
         row_start = ep_rank * num_local_rows
         flat_ids = hash_ids.reshape(-1)
         owner = torch.div(flat_ids, num_local_rows, rounding_mode="floor")
-        if owner.numel() and int(owner.max()) >= ep_size:
+        tracing = _is_tracing_or_compiling()
+        if tracing:
+            torch._check(((owner >= 0) & (owner < ep_size)).all().item(),
+                         lambda: "Engram hash requested a row outside the padded table")
+        elif owner.numel() and int(owner.max()) >= ep_size:
             raise IndexError("Engram hash requested a row outside the padded table")
-        local_counts = torch.bincount(owner, minlength=ep_size).to(torch.long)
-        gathered_counts = [torch.empty_like(local_counts) for _ in range(ep_size)]
-        dist.all_gather(gathered_counts, local_counts, group=ep_group)
-        all_counts = torch.stack(gathered_counts)
-        send_counts = local_counts.cpu().tolist()
-        recv_counts = all_counts[:, ep_rank].cpu().tolist()
+        local_counts = torch.zeros(ep_size, dtype=torch.long, device=owner.device)
+        local_counts.scatter_add_(0, owner, torch.ones_like(owner))
+        receive_counts = ep_exchange_counts(local_counts, ep_group)
+        send_counts = ep_split_sizes(local_counts, flat_ids.numel())
+        recv_counts = ep_split_sizes(receive_counts)
 
         # Ascend ArgSort executes integer inputs on AiCPU. The owner range is
         # bounded by ep_size, so float32 preserves it exactly and stays on AiCore.
@@ -326,7 +332,10 @@ class ParallelEngram:
         sorted_ids = flat_ids.index_select(0, sort_indices)
         received_ids = ep_all_to_all(sorted_ids, send_counts, recv_counts, ep_group)
         local_ids = received_ids - row_start
-        if local_ids.numel() and (int(local_ids.min()) < 0 or int(local_ids.max()) >= num_local_rows):
+        if tracing:
+            torch._check(((local_ids >= 0) & (local_ids < num_local_rows)).all().item(),
+                         lambda: "Engram EP routing delivered a row to the wrong owner")
+        elif local_ids.numel() and (int(local_ids.min()) < 0 or int(local_ids.max()) >= num_local_rows):
             raise IndexError("Engram EP routing delivered a row to the wrong owner")
         # Call the child module instead of reading ``embedding.weight``
         # directly. This preserves the FSDP pre/post-forward lifecycle when

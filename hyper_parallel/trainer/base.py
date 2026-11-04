@@ -1179,6 +1179,9 @@ class BaseTrainer(Stateful, ABC):
 
     def destroy_distributed(self) -> None:
         """Synchronize all ranks and tear down the distributed process group."""
+        graph_compiler = getattr(self, "graph_compiler", None)
+        if graph_compiler is not None:
+            graph_compiler.close()
         if not dist.is_available() or not dist.is_initialized():
             return
 

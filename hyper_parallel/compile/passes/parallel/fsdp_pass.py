@@ -214,6 +214,10 @@ def _free_tensor_storage(tensor: torch.Tensor) -> None:
     # fake values whose storage cannot be resized; there is nothing to free.
     if isinstance(tensor, FakeTensor):
         return
+    # Replay handles borrow graph-pool storage. Resizing their non-owning
+    # Storage would only invalidate the address needed by the next replay.
+    if getattr(tensor, "_aclgraph_non_owning", False):
+        return
     if isinstance(tensor, torch.Tensor) and tensor.untyped_storage().size() > 0:
         tensor.untyped_storage().resize_(0)
 
@@ -1189,7 +1193,7 @@ class FSDPPass(GraphPass):
         graph: fx.Graph, gradient: fx.Node, group_name: str
     ) -> fx.Node:
         """Sum replicated source-layout contributions after completed DP reduction."""
-        contiguous = graph.call_method("contiguous", args=(gradient,))
+        contiguous = graph.call_function(torch.ops.aten.contiguous.default, args=(gradient,))
         reduced = graph.call_function(
             _c10d_functional.all_reduce, args=(contiguous, "sum", group_name)
         )
@@ -1228,7 +1232,7 @@ class FSDPPass(GraphPass):
         group_name, degree = info.group_name, info.degree
         reduced = grad_node
         if info.reduction.scale is not None:
-            reduced = graph.call_function(torch.mul, args=(reduced, info.reduction.scale))
+            reduced = graph.call_function(torch.ops.aten.mul.Tensor, args=(reduced, info.reduction.scale))
         if degree == 1 and self._dp_mode == "fsdp":
             return reduced
         if pad_info is not None:
@@ -1236,7 +1240,7 @@ class FSDPPass(GraphPass):
             # right by ``dim0_pad`` and leave every other dim untouched.
             pad_tuple = tuple([0, 0] * (pad_info.ndim - 1) + [0, pad_info.dim0_pad])
             reduced = graph.call_function(
-                torch.constant_pad_nd, args=(reduced, pad_tuple)
+                torch.ops.aten.constant_pad_nd.default, args=(reduced, pad_tuple)
             )
             reduced.meta["comm_type"] = "fsdp_grad_pad"
             value = grad_node.meta.get("val")
@@ -1266,7 +1270,7 @@ class FSDPPass(GraphPass):
                     reduced = self._insert_wait(graph, reduced)
         elif self._dp_mode in ("fsdp", "hsdp"):
             # Matmul backward can return a transposed view on NPU, including dense router weights.
-            reduced = graph.call_method("contiguous", args=(reduced,))
+            reduced = graph.call_function(torch.ops.aten.contiguous.default, args=(reduced,))
             rs_node = graph.call_function(
                 _c10d_functional.reduce_scatter_tensor,
                 args=(
@@ -1276,6 +1280,8 @@ class FSDPPass(GraphPass):
                     group_name,
                 ),
             )
+            # Native contiguous needs an owner so schedulers can move it with this RS.
+            reduced.meta.update(autograd_backward=True, fsdp_reduce_scatter_prepare=rs_node.name)
             rs_node.meta["comm_type"] = "fsdp_reduce_scatter"
             rs_node.meta["comm_group"] = group_name
             rs_node.meta["fsdp_degree"] = degree

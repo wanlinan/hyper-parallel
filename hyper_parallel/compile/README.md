@@ -50,6 +50,8 @@ TorchInductor kernels, after which the FX graph wraps the compiled callable
 and no further graph-level pass may run. With PP enabled it compiles the
 schedule's per-stage forward/backward subgraphs instead of the stub (see
 below).
+With Inductor and PP disabled, optional `ACLGraphPass` captures the final
+scheduled FX regions after FSDP and communication scheduling.
 
 **ActivationCheckpointPass** (static-graph activation checkpointing,
 `PassConfig.ac_mode`):
@@ -250,6 +252,9 @@ Disable reshard with `PassConfig(fsdp_reshard_after_forward=False)`.
   outputs.
   `inductor_configs` (a `PassConfig` field) forwards
   `torch._inductor.config` overrides to the compiled regions.
+- NPU compilation initializes the selected `torch_npu` Inductor backend,
+  configured by the installed runtime (for example,
+  `TORCHINDUCTOR_NPU_BACKEND=ascendc`).
 
 Inductor settings live on `PassConfig` (like the PP settings), not in the
 YAML-facing `compile:` section:
@@ -259,6 +264,95 @@ pass_config = PassConfig(
     inductor_mode="regional",                  # or "full"
     inductor_configs={"reorder_for_peak_memory": True},  # optional overrides
 )
+```
+
+**ACLGraphPass** (NPU joint-graph capture, opt-in):
+
+```python
+pass_config = PassConfig(aclgraph_mode="static")
+compiler = GraphCompiler(model, train_fn, pass_config=pass_config)
+try:
+    loss, loss_dict = compiler.forward_backward(**batch)
+finally:
+    compiler.close()  # before destroying distributed process groups
+```
+
+The pass runs after FSDP, bucketing and communication scheduling. It splits the
+final FX graph into contiguous device regions and eager host regions. CPU tensor
+operations, scalar reads and unknown Python helpers remain eager. A known FSDP
+storage release can stay inside a region when its allocation and all aliases are
+private to that region, with no escaping storage or later reader. Allocation
+ownership is established from native clone or functional all-gather and explicit
+wait/view aliases. Missing metadata, external storage and boundary mutations keep
+the release eager, except for native `copy_`, `add_` and `logical_and_` writes unrelated to the released
+storage; those use the existing static-state input handling. Rejected releases split the graph again until the ownership
+proof is stable; releases are never deleted. Each device region executes one warmup call, records on its second call,
+and then replays with current inputs and live model parameters. Lifted state and
+mutated inputs keep their storage; ordinary contiguous user inputs are copied to
+persistent buffers. Escaping outputs are copied so a later replay cannot overwrite
+an earlier loss or gradient.
+Dynamic Tensor leaves inside lists or dictionaries are staged recursively;
+non-overlapping slices retain their original strides. Explicitly static state
+containers retain their storage and address guards.
+Captured consumers of the same read-only native producer share one staging
+buffer per layout and recording generation. This reuse excludes storage aliases
+written anywhere in the scheduled graph, escaping outputs, and unknown Python
+helper results. Each shared consumer still copies its current input before
+replay. Completed partition calls release their interpreter environment
+so returned gradients remain live only as long as their caller needs them.
+
+Routed-expert dispatch, expert computation and combine stay eager, including
+their recompute and backward operations. The EP entry points annotate this
+scope, and module metadata with an exact `experts` or `routed_experts` path
+component is also excluded. Fixed-layout router and shared-expert work can
+still be captured. No expert capacity padding or cached routing splits are
+introduced: each batch retains its actual token counts and All-to-All splits.
+Nodes whose tensor layouts or scalar metadata contain unbacked, data-dependent
+symbols, and their direct consumers, also stay eager. Ordinary symbolic input
+dimensions do not by themselves prevent capture.
+
+`compile.aclgraph_max_capture_regions` limits native graph resource use when
+host boundaries produce many small regions. Its default `0` captures every
+eligible region. A positive value retains the regions with the most FX nodes,
+breaking ties in trace order; the remaining regions run eagerly and adjacent
+eager regions are combined. The budget selects complete regions after the storage
+ownership checks. It never moves dynamic EP or unproven host work into capture.
+`graph_module.meta["aclgraph_partition_stats"]` records strict candidates,
+regions after private-release merging, budget selection and rejected proofs.
+
+`aclgraph_mode` accepts `off` (default), `static`, or `dynamic`. Static replay
+checks shapes, strides, dtype, device, Python constants, and state addresses and
+raises on an incompatible input. Dynamic mode coordinates recapture over a Gloo
+CPU group before executing captured HCCL work. All ranks must enable the same
+mode and execute the same region order. To change tensor shapes across calls,
+also enable `dynamic` or `dynamic_arg_dims` on the compiler; ACLGraph does not
+remove the tracer's input guards. Dynamic mode re-records graphs; it does not
+update recorded kernel dimensions or collective splits in place.
+
+The YAML-driven Trainer exposes the same option:
+
+```yaml
+compile:
+  enabled: true
+  use_joint_graph: true
+  aclgraph_mode: static
+```
+
+The Trainer projects this setting onto `PassConfig` and releases captures before
+its distributed teardown. Standalone `GraphCompiler` and `GraphTrainer` callers
+must call `close()` before destroying process groups. Capture requires `torch_npu`
+and task queue mode 0 or 1; mode 2 is switched to 1 using the runtime API when
+available. CPU-only graphs keep normal FX execution without loading this backend.
+ACLGraph requires `inductor_mode="off"` and `pp_enabled=False`. Enabling capture
+with either regional or full Inductor compilation, or with PP, raises `ValueError`.
+
+CPU contracts live in [test_aclgraph_pass.py](../../tests/ut/compile/test_aclgraph_pass.py).
+Native replay, state updates, and two-card FSDP/shape-recapture checks live in
+[test_aclgraph.py](../../tests/torch/compile/test_aclgraph.py).
+Activate a matching CANN compiler/runtime environment before running:
+
+```bash
+TASK_QUEUE_ENABLE=1 python -m pytest tests/torch/compile/test_aclgraph.py -q
 ```
 
 **FsdpOverlapPass** (independent FSDP graph controls):
@@ -493,7 +587,7 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
   recompute scope are always saved (the graph cannot replay random state),
   so a block whose dropout must be recomputed is out of scope for the static
   path — eager full AC replays them by forking the RNG state instead.
-- **`InductorPass` composes with PP (and everything else)**: `regional` /
+- **`InductorPass` supports PP**: `regional` /
   `full` backend compilation runs after `PpPass` and compiles each virtual
   stage's forward/backward subgraph through the schedule's
   `map_stage_graphs` hook; the schedule stub itself is never compiled and its

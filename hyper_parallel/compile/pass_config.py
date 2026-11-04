@@ -36,6 +36,7 @@ __all__ = [
     "GradientReduction",
     "PP_SCHEDULES",
     "INDUCTOR_MODES",
+    "ACLGRAPH_MODES",
     "DP_MODES",
     "AC_MODES",
     "AC_REGION_SOURCES",
@@ -63,6 +64,8 @@ PP_SCHEDULES = ("gpipe", "1f1b", "interleaved_1f1b", "vpp")
 #                side-effectful nodes stay eager (see InductorPass)
 #   "full"     - compile the whole joint graph as one Inductor region
 INDUCTOR_MODES = ("off", "regional", "full")
+
+ACLGRAPH_MODES = ("off", "static", "dynamic")
 
 # Schedule names that can drive multiple virtual stages per physical rank.
 _INTERLEAVED_SCHEDULES = ("interleaved_1f1b", "vpp")
@@ -299,6 +302,13 @@ class PassConfig:
             regions earlier to overlap H2D copies with preceding backward
             compute. ``0`` keeps the reload immediately before its consumer.
             Graph-mode only.
+        aclgraph_mode: NPU joint-graph capture: ``"off"`` (default),
+            ``"static"`` (reject changed replay inputs), or ``"dynamic"``
+            (coordinate recapture across ranks). Host work stays eager.
+            Requires Inductor compilation and PP to be disabled.
+        aclgraph_max_capture_regions: Maximum number of captured device regions.
+            Zero preserves every eligible region. Positive values retain the
+            largest regions by FX node count and leave the rest eager.
 
     Note:
         ``fsdp_enabled`` / ``pp_enabled`` no longer probe
@@ -335,6 +345,8 @@ class PassConfig:
     activation_swap: str = "none"
     offload_budget_gb: float = 64.0
     offload_prefetch_n_layers: int = 1
+    aclgraph_mode: str = "off"
+    aclgraph_max_capture_regions: int = 0
 
     def __post_init__(self) -> None:
         self.dp_mode = normalize_dp_mode(self.dp_mode)
@@ -356,6 +368,7 @@ class PassConfig:
         self._validate_pp()
         self._validate_ac()
         self._validate_offload()
+        self._validate_aclgraph()
 
     def _validate_ac(self) -> None:
         """Validate the activation checkpointing mode and layer selectors."""
@@ -457,6 +470,16 @@ class PassConfig:
         prefetch = self.offload_prefetch_n_layers
         if isinstance(prefetch, bool) or not isinstance(prefetch, int) or prefetch < 0:
             raise ValueError("offload_prefetch_n_layers must be a non-negative integer")
+
+    def _validate_aclgraph(self) -> None:
+        """Validate capture mode and the initial joint-FX execution boundary."""
+        count = self.aclgraph_max_capture_regions
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("aclgraph_max_capture_regions must be a non-negative integer")
+        if self.aclgraph_mode not in ACLGRAPH_MODES:
+            raise ValueError(f"aclgraph_mode must be one of {ACLGRAPH_MODES}, got {self.aclgraph_mode!r}")
+        if self.aclgraph_mode != "off" and (self.pp_enabled or self.inductor_mode != "off"):
+            raise ValueError("ACLGraph currently requires pp_enabled=False and inductor_mode='off'")
 
     def _validate_flags(self) -> None:
         """Validate boolean flags and the overlap memory budget."""
@@ -645,4 +668,6 @@ def build_pass_config_from_trainer_config(
         offload_prefetch_n_layers=getattr(
             compile_config, "offload_prefetch_n_layers", 1
         ),
+        aclgraph_mode=getattr(compile_config, "aclgraph_mode", "off"),
+        aclgraph_max_capture_regions=getattr(compile_config, "aclgraph_max_capture_regions", 0),
     )

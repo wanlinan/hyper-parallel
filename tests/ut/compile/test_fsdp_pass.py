@@ -54,8 +54,9 @@ from torch import fx, nn
 
 from hyper_parallel.compile.compiler import GraphCompiler
 from hyper_parallel.compile.pass_config import GradientReduction, PassConfig
-from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
-from hyper_parallel.compile.passes.parallel.fsdp_pass import FsdpParamSpec, FsdpPlan
+from hyper_parallel.compile.passes.parallel.fsdp_pass import (
+    FSDPPass, FsdpParamSpec, FsdpPlan, _GradReductionInfo, _PaddedParam,
+)
 from hyper_parallel.compile.graph_parallel_plan import GraphParallelPlan
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.distributed.mesh import MeshContext
@@ -626,7 +627,7 @@ class TestFSDPPassRunSharding(unittest.TestCase):
 
     def _assert_gradient_reductions(self, graph_module, reductions):
         """Dense AVG and expert prescaled SUM use their selected groups."""
-        scales = [node for node in graph_module.graph.nodes if node.target == torch.mul]
+        scales = [node for node in graph_module.graph.nodes if node.target == torch.ops.aten.mul.Tensor]
         self.assertEqual([node.args[1] for node in scales], [0.25])
         self.assertEqual(scales[0].args[0].name, "grad_lin_weight")
         for node in reductions:
@@ -675,7 +676,7 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                 self.assertEqual(_count_targets(gm, "narrow"), 1)
                 reductions = [node for node in gm.graph.nodes if node.meta.get("comm_type") == "fsdp_reduce_scatter"]
                 self.assertEqual({node.args[2:] for node in reductions}, set(expected_gathers.values()))
-                self.assertTrue(all(node.args[0].target == "contiguous" for node in reductions))
+                self.assertTrue(all(node.args[0].target == torch.ops.aten.contiguous.default for node in reductions))
                 replicated = [node for node in gm.graph.nodes if node.meta.get("comm_type") == "fsdp_all_reduce"]
                 self.assertEqual([node.args[2] for node in replicated], ["dense"])
                 groups = {node.meta["comm_group"] for node in gm.graph.nodes if "comm_group" in node.meta}
@@ -708,6 +709,51 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                 self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 0)
                 self.assertEqual(_count_targets(gm, "reduce_scatter_tensor"), 0)
                 self.assertEqual(_count_targets(gm, "wait_tensor"), 0)
+
+    def test_padded_noncontiguous_gradient_reduction_preserves_values_and_dtype(self) -> None:
+        """Prescaling, padding and source-layout reduction keep their numerical contract."""
+        collective_inputs = []
+
+        class SimulatedReduction(fx.Interpreter):
+            """Use identical peer gradients without creating process groups."""
+
+            def call_function(self, target: object, args: tuple, kwargs: dict) -> object:
+                """Execute preparation normally and simulate the collective results."""
+                if "reduce_scatter_tensor" in str(target):
+                    collective_inputs.append(args[0])
+                    return args[0].chunk(args[2], dim=0)[-1] * args[2]
+                if "all_reduce" in str(target):
+                    collective_inputs.append(args[0])
+                    return args[0] * 2
+                if "wait_tensor" in str(target):
+                    return args[0]
+                return super().call_function(target, args, kwargs)
+
+        for dtype in (torch.float32, torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                collective_inputs.clear()
+                gradient = torch.arange(1, 13, dtype=dtype).reshape(4, 3).t()
+                original = gradient.clone()
+                graph = fx.Graph()
+                grad_node = graph.placeholder("gradient")
+                grad_node.meta["val"] = gradient
+                reduced = FSDPPass()._build_grad_reduction_nodes(
+                    graph, grad_node, _GradReductionInfo("fsdp", 2, GradientReduction("sum", 8)),
+                    pad_info=_PaddedParam(3, 4, 1, 2),
+                )
+                reduced = FSDPPass._insert_source_gradient_reduction(graph, reduced, "source")
+                graph.output(reduced)
+                result = SimulatedReduction(fx.GraphModule({}, graph)).run(gradient)
+                expected = torch.cat((gradient / 2, gradient.new_zeros(1, 4)), dim=0)[2:]
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                torch.testing.assert_close(gradient, original, rtol=0, atol=0)
+                self.assertEqual(result.dtype, dtype, f"expected dtype={dtype}, got dtype={result.dtype}")
+                shapes = [tuple(value.shape) for value in collective_inputs]
+                self.assertEqual(shapes, [(4, 4), (2, 4)], f"expected shapes={[(4, 4), (2, 4)]}, got shapes={shapes}")
+                self.assertTrue(
+                    all(value.is_contiguous() for value in collective_inputs),
+                    f"expected contiguous inputs, got strides={[value.stride() for value in collective_inputs]}",
+                )
 
     def test_unmarked_expert_fallback_uses_edp_group(self):
         """A partial-plan expert fallback must never reduce across dense/EP peers."""

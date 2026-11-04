@@ -83,10 +83,10 @@ from torch import fx, nn
 from torch._subclasses import FakeTensor
 from torch.fx.graph import CodeGen
 from torch.fx.node import _side_effectful_functions
-from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 
 from ..pass_config import PassConfig
 from .base import GraphPass
+from .graph_metadata import propagate_fake_values
 
 _LOG = logging.getLogger(__name__)
 
@@ -146,7 +146,7 @@ def _placeholder_fake_args(gm: fx.GraphModule) -> list:
     return args
 
 
-def _propagate_fake_vals(gm: fx.GraphModule) -> fx.GraphModule:
+def _propagate_fake_vals(gm: fx.GraphModule, model: Optional[nn.Module] = None) -> fx.GraphModule:
     """Fill ``meta["val"]`` on nodes inserted after tracing (FSDP collectives,
     pad views, reshard frees) so ``regional_inductor`` can size each region.
 
@@ -161,8 +161,7 @@ def _propagate_fake_vals(gm: fx.GraphModule) -> fx.GraphModule:
             "carry fake meta['val'] tensors"
         )
     fake_args = _placeholder_fake_args(gm)
-    FakeTensorProp(gm, fake_mode).propagate_dont_convert_inputs(*fake_args)
-    return gm
+    return propagate_fake_values(gm, tuple(fake_args), model)
 
 
 def _node_is_comm(node: fx.Node) -> bool:
@@ -342,7 +341,7 @@ class InductorPass(GraphPass):
                     "JointGraph.example_inputs) to size compiled regions"
                 )
             if _regional_inductor_available():
-                self._compile_graph(graph_module, pass_config, example_inputs)
+                self._compile_graph(graph_module, pass_config, model=kwargs.get("model"))
                 compiled = True
             else:
                 self._warn_unavailable(mode)
@@ -396,9 +395,7 @@ class InductorPass(GraphPass):
 
         for schedule in schedules:
             schedule.map_stage_graphs(
-                lambda stage_gm: self._compile_graph(
-                    stage_gm, pass_config, example_inputs=None
-                )
+                lambda stage_gm: self._compile_graph(stage_gm, pass_config)
             )
         _LOG.info(
             "InductorPass: compiled %d PP schedule(s) in %r mode",
@@ -411,19 +408,17 @@ class InductorPass(GraphPass):
         self,
         graph_module: fx.GraphModule,
         pass_config: PassConfig,
-        example_inputs: Optional[Sequence[Any]],
+        model: Optional[nn.Module] = None,
     ) -> fx.GraphModule:
-        """Compile one FX graph (joint graph or one PP stage subgraph).
-
-        ``example_inputs`` is ``None`` for PP stage subgraphs, whose inputs
-        are derived from their own placeholder metas (the joint graph's
-        inputs do not match a stage's placeholder list).
-        """
+        """Compile one graph using its own placeholder metadata as inputs."""
         mode = pass_config.inductor_mode
         output_spec, graph_module = _flatten_nested_outputs(graph_module)
-        _propagate_fake_vals(graph_module)
-        if example_inputs is None:
-            example_inputs = _placeholder_fake_args(graph_module)
+        _propagate_fake_vals(graph_module, model)
+        example_inputs = _placeholder_fake_args(graph_module)
+        if any(isinstance(value, torch.Tensor) and value.device.type == "npu" for value in example_inputs):
+            # standalone_compile bypasses Dynamo's lazy NPU backend setup.
+            npu_dynamo = importlib.import_module("torch_npu.utils._dynamo")
+            npu_dynamo.register_inductor_npu()
         _LOG.info(
             "InductorPass: compiling graph in %r mode (%d placeholders, %d nodes)",
             mode,
@@ -520,9 +515,18 @@ class InductorPass(GraphPass):
         the collective launch/wait nodes remain plain FX nodes so the overlap
         passes' scheduling decisions stay observable at runtime.
         """
+        region_id = 0
+        in_region = False
         for node in graph_module.graph.nodes:
             if node.op not in ("call_function", "call_method"):
                 continue
             if _node_is_comm(node) or _node_is_side_effectful(node):
+                in_region = False
                 continue
+            if not in_region:
+                region_id += 1
+                in_region = True
             _tag_node(node, inductor_configs)
+            # Capability partitioning otherwise merges non-adjacent compute
+            # across storage frees, delaying a parameter read until after free.
+            node.meta["custom"]["compile_with_inductor"]["inductor_region"] = region_id

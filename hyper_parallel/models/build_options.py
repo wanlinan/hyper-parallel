@@ -126,6 +126,10 @@ class CompileConfig:
     attention activation offload selected by the top-level ``activation_swap``
     field (they have no eager counterpart).
     Eager FSDP2 module prefetch depths do not configure these graph passes.
+    ``aclgraph_mode`` optionally records NPU joint-graph regions, with static
+    replay guards or coordinated dynamic recapture. It defaults to ``"off"``.
+    ``aclgraph_max_capture_regions`` limits native graph resources by keeping
+    the largest device regions by FX node count; zero means unlimited.
     """
 
     enabled: bool = False
@@ -143,6 +147,8 @@ class CompileConfig:
     max_in_flight_gb: float = 0.25
     offload_budget_gb: float = 64.0
     offload_prefetch_n_layers: int = 1
+    aclgraph_mode: str = "off"
+    aclgraph_max_capture_regions: int = 0
 
     def selects_graph_compiler(self) -> bool:
         """Return whether this config selects the graph-compiler trainer path."""
@@ -159,6 +165,7 @@ class CompileConfig:
                 raise TypeError(f"compile.{name} must be a bool")
         self._validate_max_in_flight_gb()
         self._validate_offload()
+        self._validate_aclgraph()
         if self.dynamic_arg_dims is not None and not isinstance(self.dynamic_arg_dims, dict):
             raise ValueError("compile.dynamic_arg_dims must be a mapping or None")
         if not isinstance(self.mode, str) or not self.mode.strip():
@@ -179,6 +186,16 @@ class CompileConfig:
             or self.dynamo_cache_size_limit <= 0
         ):
             raise ValueError("compile.dynamo_cache_size_limit must be a positive integer")
+
+    def _validate_aclgraph(self) -> None:
+        """Validate capture selection and its native graph resource budget."""
+        if self.aclgraph_mode not in ("off", "static", "dynamic"):
+            raise ValueError("compile.aclgraph_mode must be 'off', 'static', or 'dynamic'")
+        if self.aclgraph_mode != "off" and not self.selects_graph_compiler():
+            raise ValueError("compile.aclgraph_mode requires enabled=True and use_joint_graph=True")
+        count = self.aclgraph_max_capture_regions
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("compile.aclgraph_max_capture_regions must be a non-negative integer")
 
     def _validate_max_in_flight_gb(self) -> None:
         """Validate the GiB bound on speculative FSDP all-gather replicas."""

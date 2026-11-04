@@ -235,6 +235,7 @@ def _index_source_layer(use_cp, state):
     torch.manual_seed(11)
     source = _IndexSource()
     source.indexer = SharedCompressedDSAIndexer(_IndexerSource())
+    source.indexer.enable_selection_exclude()
     layer = SharedCompressedDSAAttentionBase(
         source, replace_indexer=False, use_fused_ops=False
     )
